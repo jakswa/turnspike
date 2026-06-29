@@ -1,0 +1,45 @@
+{
+  "name": "turnspike",
+  "version": "0.1.0",
+  "description": "Turn-taking glue for realtime voice agents, with optional Twilio Media Streams orchestration.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./silence": {
+      "types": "./dist/silence.d.ts",
+      "import": "./dist/silence.js"
+    },
+    "./twilio": {
+      "types": "./dist/twilio.d.ts",
+      "import": "./dist/twilio.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "bun run build",
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jakswa/turnspike.git"
+  },
+  "keywords": ["realtime", "voice", "twilio", "openai", "grok"],
+  "dependencies": {
+    "ws": "^8.20.1"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
