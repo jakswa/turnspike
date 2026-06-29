@@ -1,6 +1,6 @@
 {
   "name": "turnspike",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Turn-taking glue for realtime voice agents, with optional Twilio Media Streams orchestration.",
   "type": "module",
   "main": "./dist/index.js",

@@ -21,6 +21,7 @@ class TestRealtimeConnection extends TurnspikeConnection {
   interrupts: Array<{ itemId: string; playedMs: number }> = [];
   sessionUpdates: OaiSessionConfig[] = [];
   functionOutputs: Array<{ callId: string; output: string }> = [];
+  conversationItems: Record<string, unknown>[] = [];
 
   override connect(): void {}
 
@@ -38,6 +39,10 @@ class TestRealtimeConnection extends TurnspikeConnection {
 
   override addFunctionCallOutput(callId: string, output: string): void {
     this.functionOutputs.push({ callId, output });
+  }
+
+  override sendConversationItem(item: Record<string, unknown>): void {
+    this.conversationItems.push(item);
   }
 }
 
@@ -97,6 +102,15 @@ describe('TwilioTurnspikeSession', () => {
 
     expect(realtime.sessionUpdates).toHaveLength(1);
     expect(realtime.sessionUpdates[0].instructions).toBe('Call stream_1');
+    expect(realtime.sessionUpdates[0].audio?.input?.format).toEqual({
+      type: 'audio/pcmu',
+    });
+    expect(realtime.sessionUpdates[0].audio?.input?.turn_detection).toEqual({
+      type: 'server_vad',
+    });
+    expect(realtime.sessionUpdates[0].audio?.output?.format).toEqual({
+      type: 'audio/pcmu',
+    });
     expect(realtime.sessionUpdates[0].tools?.map((tool) => tool.name)).toEqual([
       'hang_up',
     ]);
@@ -283,17 +297,24 @@ describe('TwilioTurnspikeSession', () => {
     expect(events).toEqual([{ reason: 'twilio_stop' }]);
   });
 
-  test('can drop inbound caller audio during fixed greetings', () => {
+  test('fixed greeting streams Twilio-ready audio, seeds history, and deafens until mark echo', async () => {
+    const sent: string[] = [];
     const realtime = new TestRealtimeConnection();
+    const greetingAudio = Buffer.concat([
+      Buffer.alloc(160, 1),
+      Buffer.alloc(80, 2),
+    ]);
     const agent = new TwilioTurnspikeSession({
-      twilioWs: { send: () => {} },
+      twilioWs: { send: (data) => sent.push(String(data)) },
       provider: { url: 'wss://example.test/realtime', apiKey: 'key' },
-      session: sessionConfig,
+      session: { type: 'realtime', instructions: 'Be helpful.' },
       realtime,
       connectOnStart: false,
-      shouldForwardInboundAudio: () => false,
+      fixedGreeting: { text: 'Thanks for calling.', audio: greetingAudio },
     });
     start(agent);
+    realtime.emit('session_created');
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     agent.handleTwilioEvent({
       event: 'media',
@@ -302,5 +323,42 @@ describe('TwilioTurnspikeSession', () => {
     });
 
     expect(realtime.audio).toEqual([]);
+    expect(realtime.conversationItems).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'Thanks for calling.' }],
+      },
+    ]);
+    expect(decodeSent(sent)).toEqual([
+      {
+        event: 'media',
+        streamSid: 'stream_1',
+        media: { payload: Buffer.alloc(160, 1).toString('base64') },
+      },
+      {
+        event: 'media',
+        streamSid: 'stream_1',
+        media: { payload: Buffer.alloc(80, 2).toString('base64') },
+      },
+      {
+        event: 'mark',
+        streamSid: 'stream_1',
+        mark: { name: 'greeting:30' },
+      },
+    ]);
+
+    agent.handleTwilioEvent({
+      event: 'mark',
+      streamSid: 'stream_1',
+      mark: { name: 'greeting:30' },
+    });
+    agent.handleTwilioEvent({
+      event: 'media',
+      streamSid: 'stream_1',
+      media: { payload: 'caller_audio' },
+    });
+
+    expect(realtime.audio).toEqual(['caller_audio']);
   });
 });

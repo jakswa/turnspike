@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { TurnspikeConnection } from './connection';
 import { AssistantSilenceDetector } from './silence';
+import { renderGreetingPcmu } from './tts';
 import type {
   OaiSessionConfig,
   OaiToolDefinition,
@@ -91,6 +92,19 @@ export type TwilioOutboundEvent =
   | TwilioOutboundMark
   | TwilioOutboundClear;
 
+export type FixedGreetingAudio =
+  | Buffer
+  | Uint8Array
+  | ArrayBuffer
+  | Promise<Buffer | Uint8Array | ArrayBuffer>;
+
+export interface FixedGreetingOptions {
+  text: string;
+  voice?: string;
+  audio?: FixedGreetingAudio;
+  openaiModel?: string;
+}
+
 export interface TwilioTurnspikeSessionOptions {
   twilioWs: TwilioWsLike;
   provider: RealtimeConnectOptions;
@@ -100,8 +114,7 @@ export interface TwilioTurnspikeSessionOptions {
   realtime?: TurnspikeConnection;
   silence?: AssistantSilenceDetector | { gracePeriodMs?: number };
   allowAIHangup?: boolean | AIHangupOptions;
-  /** Return false to drop inbound caller audio, useful during fixed greetings/disclosures. */
-  shouldForwardInboundAudio?: (event: TwilioMediaEvent) => boolean;
+  fixedGreeting?: string | FixedGreetingOptions;
   clearOnUserSpeech?: boolean;
   connectOnStart?: boolean;
   markPrefix?: string;
@@ -123,6 +136,10 @@ export interface TwilioTurnspikeSessionEvents {
   playback_done: [info: { itemId: string }];
   silence: [info: { itemId: string }];
   silence_ended: [info: { reason: 'assistant_audio' | 'user_speech' }];
+  fixed_greeting_started: [
+    info: { text: string; markName: string; durationMs: number },
+  ];
+  fixed_greeting_done: [info: { text: string; markName: string }];
   session_update_sent: [config: OaiSessionConfig];
   tool_call: [call: { callId: string; name: string; arguments: string }];
   ai_hangup_requested: [call: { callId: string; name: string; arguments: string }];
@@ -158,7 +175,7 @@ export class TwilioTurnspikeSession extends EventEmitter {
   private readonly twilioWs: TwilioWsLike;
   private readonly provider: RealtimeConnectOptions;
   private readonly sessionInput: TwilioTurnspikeSessionOptions['session'];
-  private readonly shouldForwardInboundAudio?: (event: TwilioMediaEvent) => boolean;
+  private readonly fixedGreeting: FixedGreetingOptions | null;
   private readonly clearOnUserSpeech: boolean;
   private readonly connectOnStart: boolean;
   private readonly markPrefix: string;
@@ -166,6 +183,9 @@ export class TwilioTurnspikeSession extends EventEmitter {
   private streamSid: string | null = null;
   private startEvent: TwilioStartEvent | null = null;
   private sessionConfigPromise: Promise<OaiSessionConfig> | null = null;
+  private greetingAudioPromise: Promise<Buffer> | null = null;
+  private greetingDeafened = false;
+  private greetingFinalMarkName: string | null = null;
   private sessionUpdateSent = false;
   private lastAssistantItemId: string | null = null;
   private itemAudioSentMs = new Map<string, number>();
@@ -181,7 +201,7 @@ export class TwilioTurnspikeSession extends EventEmitter {
     this.provider = opts.provider;
     this.sessionInput = opts.session;
     this.realtime = opts.realtime ?? new TurnspikeConnection();
-    this.shouldForwardInboundAudio = opts.shouldForwardInboundAudio;
+    this.fixedGreeting = this.normalizeFixedGreeting(opts.fixedGreeting);
     this.clearOnUserSpeech = opts.clearOnUserSpeech ?? true;
     this.connectOnStart = opts.connectOnStart ?? true;
     this.markPrefix = opts.markPrefix ?? 'item:';
@@ -249,12 +269,23 @@ export class TwilioTurnspikeSession extends EventEmitter {
         break;
 
       case 'media':
-        if (this.shouldForwardInboundAudio?.(event) === false) return;
+        if (this.greetingDeafened) return;
         this.realtime.sendAudio(event.media.payload);
         break;
 
       case 'mark':
         this.emit('mark', event);
+        if (
+          this.greetingFinalMarkName &&
+          event.mark.name === this.greetingFinalMarkName
+        ) {
+          const markName = event.mark.name;
+          const text = this.fixedGreeting?.text ?? '';
+          this.greetingDeafened = false;
+          this.greetingFinalMarkName = null;
+          this.emit('fixed_greeting_done', { text, markName });
+          break;
+        }
         if (event.mark.name.startsWith(this.markPrefix)) {
           const itemId = event.mark.name.slice(this.markPrefix.length);
           this.silence.onAssistantPlaybackDone(itemId);
@@ -334,6 +365,7 @@ export class TwilioTurnspikeSession extends EventEmitter {
     });
 
     this.realtime.on('speech_started', () => {
+      if (this.greetingDeafened) return;
       this.silence.onUserSpeechStarted();
       const itemId = this.lastAssistantItemId;
       if (itemId) {
@@ -384,7 +416,9 @@ export class TwilioTurnspikeSession extends EventEmitter {
       typeof this.sessionInput === 'function'
         ? await this.sessionInput({ start })
         : this.sessionInput;
-    return this.withBuiltInTools(base);
+    const config = this.withBuiltInTools(this.withTwilioAudioDefaults(base));
+    this.prerenderFixedGreeting(config);
+    return config;
   }
 
   private async sendSessionUpdate(): Promise<void> {
@@ -397,6 +431,29 @@ export class TwilioTurnspikeSession extends EventEmitter {
     this.realtime.sendSessionUpdate(config);
     this.sessionUpdateSent = true;
     this.emit('session_update_sent', config);
+    this.startFixedGreeting().catch((err) => this.emit('error', err));
+  }
+
+  private withTwilioAudioDefaults(config: OaiSessionConfig): OaiSessionConfig {
+    return {
+      ...config,
+      output_modalities: config.output_modalities ?? ['audio'],
+      audio: {
+        ...config.audio,
+        input: {
+          ...config.audio?.input,
+          format: config.audio?.input?.format ?? { type: 'audio/pcmu' },
+          turn_detection: config.audio?.input?.turn_detection ?? {
+            type: 'server_vad',
+          },
+        },
+        output: {
+          ...config.audio?.output,
+          format: config.audio?.output?.format ?? { type: 'audio/pcmu' },
+          voice: config.audio?.output?.voice ?? this.defaultGreetingVoice(),
+        },
+      },
+    };
   }
 
   private withBuiltInTools(config: OaiSessionConfig): OaiSessionConfig {
@@ -424,6 +481,98 @@ export class TwilioTurnspikeSession extends EventEmitter {
     if (typeof this.hangupTimer.unref === 'function') this.hangupTimer.unref();
 
     this.realtime.addFunctionCallOutput(callId, this.hangup.toolOutput);
+  }
+
+  private normalizeFixedGreeting(
+    input: TwilioTurnspikeSessionOptions['fixedGreeting'],
+  ): FixedGreetingOptions | null {
+    if (!input) return null;
+    const greeting =
+      typeof input === 'string'
+        ? { text: input.trim() }
+        : { ...input, text: input.text.trim() };
+    return greeting.text ? greeting : null;
+  }
+
+  private prerenderFixedGreeting(config: OaiSessionConfig): void {
+    const greeting = this.fixedGreeting;
+    if (!greeting || this.greetingAudioPromise) return;
+    if (!greeting.text) return;
+    const voice =
+      greeting.voice ?? config.audio?.output?.voice ?? this.defaultGreetingVoice();
+    this.greetingAudioPromise = Promise.resolve(
+      greeting.audio ??
+        renderGreetingPcmu({
+          text: greeting.text,
+          voice,
+          provider: this.provider,
+          openaiModel: greeting.openaiModel,
+        }),
+    ).then((audio) => this.toBuffer(audio));
+    this.greetingAudioPromise.catch(() => {});
+  }
+
+  private toBuffer(audio: Buffer | Uint8Array | ArrayBuffer): Buffer {
+    if (Buffer.isBuffer(audio)) return audio;
+    if (audio instanceof ArrayBuffer) return Buffer.from(new Uint8Array(audio));
+    return Buffer.from(audio);
+  }
+
+  private async startFixedGreeting(): Promise<void> {
+    const greeting = this.fixedGreeting;
+    if (!greeting) return;
+    if (!this.streamSid) {
+      throw new Error('Cannot play fixed greeting before Twilio start');
+    }
+    if (!this.greetingAudioPromise) {
+      throw new Error('fixed greeting audio was not rendered');
+    }
+
+    this.greetingDeafened = true;
+    let pcmu: Buffer;
+    try {
+      pcmu = await this.greetingAudioPromise;
+    } catch (err) {
+      this.greetingDeafened = false;
+      this.greetingFinalMarkName = null;
+      throw err;
+    }
+    this.realtime.sendConversationItem({
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: greeting.text }],
+    });
+
+    const chunkBytes = 160;
+    let cumulativeMs = 0;
+    for (let i = 0; i < pcmu.length; i += chunkBytes) {
+      const slice = pcmu.subarray(i, i + chunkBytes);
+      this.sendToTwilio({
+        event: 'media',
+        streamSid: this.streamSid,
+        media: { payload: slice.toString('base64') },
+      });
+      cumulativeMs += Math.floor(slice.length / PCMU_BYTES_PER_MS);
+    }
+
+    const markName = `greeting:${cumulativeMs}`;
+    this.greetingFinalMarkName = markName;
+    this.sendToTwilio({
+      event: 'mark',
+      streamSid: this.streamSid,
+      mark: { name: markName },
+    });
+    this.emit('fixed_greeting_started', {
+      text: greeting.text,
+      markName,
+      durationMs: cumulativeMs,
+    });
+  }
+
+  private defaultGreetingVoice(): string {
+    if (this.provider.provider === 'grok') return 'ara';
+    if (this.provider.url?.includes('api.x.ai')) return 'ara';
+    return 'alloy';
   }
 
   private performHangup(toolCallId: string): void {
