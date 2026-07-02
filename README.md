@@ -73,6 +73,8 @@ conn.connect({ url: 'wss://example.com/v1/realtime?model=...', apiKey });
 
 The core connection intentionally does not know about Twilio, databases, call records, or your tool implementations. Your app owns transport-specific audio plumbing and business logic.
 
+Client events sent while the websocket is still connecting (like the `session.update` in the example above) are queued and flushed once the socket opens. Caller audio (`input_audio_buffer.append`) is realtime and is dropped instead of queued.
+
 ## Optional Twilio Session
 
 If you are using Twilio Media Streams, the opt-in session orchestrator can handle the Twilio-specific websocket juggling plus realtime session ordering: provider connect, `session.update`, Twilio/OpenAI PCMU audio defaults, inbound media forwarding, outbound media writes, `clear` on barge-in, final `mark` messages, fixed greeting playback, silence detection after Twilio confirms playback, and optional AI-owned hangup.
@@ -110,5 +112,7 @@ agent.handleTwilioMessage(rawMessage);
 When `fixedGreeting` is set, the session renders the text to Twilio-ready 8kHz μ-law audio, streams it to Twilio in 20ms frames, sends a final greeting `mark`, and drops inbound caller audio until Twilio echoes that mark. It also inserts the greeting as an assistant conversation item so the realtime model continues with the right context.
 
 When `allowAIHangup` is enabled, the session owns the `hang_up` tool. After the model asks to hang up, the session sends the tool result, waits for the next mark-backed silence window, closes the Twilio websocket, and emits `hangup` / `ended`. If the caller hangs up first, Twilio `stop` ends the session instead. Transfer, persistence, prompts, and custom tool implementations stay in your app.
+
+Whatever ends the call, the session closes the realtime provider websocket when it emits `ended`, so upstream sessions do not idle open after the caller is gone.
 
 Start-of-call nuance: Twilio `start` captures `streamSid` and builds the session config before connecting. The orchestrator sends `session.update` only after the realtime provider emits `session_created`, so built-in tools like `hang_up` are present before the model can use them.

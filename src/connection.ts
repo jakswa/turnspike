@@ -19,10 +19,24 @@ function env(name: string): string | undefined {
   return typeof process !== 'undefined' ? process.env?.[name] : undefined;
 }
 
-function resolveConnectOptions(opts?: RealtimeConnectOptions): Required<
+function envKeyForProvider(provider?: string): string | undefined {
+  if (provider === 'grok') return env('XAI_API_KEY');
+  if (provider === 'openai') return env('OPENAI_API_KEY');
+  return undefined;
+}
+
+export function resolveConnectOptions(opts?: RealtimeConnectOptions): Required<
   Pick<RealtimeConnectOptions, 'url'>
 > & { apiKey?: string; headers?: Record<string, string> } {
-  if (opts?.url) return { url: opts.url, apiKey: opts.apiKey, headers: opts.headers };
+  if (opts?.url) {
+    // Only fall back to env keys when a known provider is named, so a custom
+    // URL never silently receives an OpenAI/xAI key.
+    return {
+      url: opts.url,
+      apiKey: opts.apiKey ?? envKeyForProvider(opts.provider),
+      headers: opts.headers,
+    };
+  }
 
   if (opts?.provider === 'grok') {
     return {
@@ -43,6 +57,7 @@ export class TurnspikeConnection extends EventEmitter {
   private ws: WebSocket | null = null;
   private readonly id: string;
   private readonly logger: RealtimeLogger;
+  private pendingSends: string[] = [];
   private lastAudioItemId: string | null = null;
   private sessionCreatedEmitted = false;
   private sessionUpdatedEmitted = false;
@@ -82,6 +97,18 @@ export class TurnspikeConnection extends EventEmitter {
   }
 
   connect(opts?: RealtimeConnectOptions): void {
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.CONNECTING ||
+        this.ws.readyState === WebSocket.OPEN)
+    ) {
+      this.logger.warn?.(
+        { id: this.id, readyState: this.ws.readyState },
+        'connect() ignored; socket already connecting or open',
+      );
+      return;
+    }
+
     const { url, apiKey, headers } = resolveConnectOptions(opts);
 
     if (!apiKey) {
@@ -107,6 +134,7 @@ export class TurnspikeConnection extends EventEmitter {
 
     this.ws.on('open', () => {
       this.logger.info?.({ id: this.id, url }, 'Realtime WebSocket connected');
+      this.flushPendingSends();
       this.emitSessionCreatedOnce();
     });
 
@@ -136,6 +164,7 @@ export class TurnspikeConnection extends EventEmitter {
         { id: this.id, code, reason: reason.toString() },
         'Realtime WebSocket closed',
       );
+      this.pendingSends = [];
       this.emit('close', code, reason.toString());
     });
   }
@@ -233,12 +262,23 @@ export class TurnspikeConnection extends EventEmitter {
     const eventType = (event as { type?: string }).type ?? 'unknown';
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(event));
-    } else if (eventType !== 'input_audio_buffer.append') {
+    } else if (eventType === 'input_audio_buffer.append') {
+      // Audio is realtime; stale caller audio is dropped rather than queued.
+    } else if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+      this.pendingSends.push(JSON.stringify(event));
+    } else {
       this.logger.warn?.(
         { id: this.id, eventType, readyState: this.ws?.readyState },
         'send() dropped; socket not open',
       );
     }
+  }
+
+  private flushPendingSends(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const pending = this.pendingSends;
+    this.pendingSends = [];
+    for (const payload of pending) this.ws.send(payload);
   }
 
   private handleEvent(event: OaiServerEvent): void {
@@ -267,6 +307,11 @@ export class TurnspikeConnection extends EventEmitter {
         break;
 
       case 'response.output_audio.done':
+        // Clear the fallback marker so response.done does not re-emit
+        // audio_done for an item that already completed.
+        if (this.lastAudioItemId === event.item_id) {
+          this.lastAudioItemId = null;
+        }
         this.emit('audio_done', event.item_id);
         break;
 

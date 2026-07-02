@@ -65,6 +65,10 @@ export class AssistantSilenceDetector extends EventEmitter {
     this.gracePeriodMs = ms;
   }
 
+  getGracePeriodMs(): number {
+    return this.gracePeriodMs;
+  }
+
   isSilent(): boolean {
     return this.state.kind === 'silent';
   }

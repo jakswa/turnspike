@@ -22,8 +22,13 @@ class TestRealtimeConnection extends TurnspikeConnection {
   sessionUpdates: OaiSessionConfig[] = [];
   functionOutputs: Array<{ callId: string; output: string }> = [];
   conversationItems: Record<string, unknown>[] = [];
+  closed = 0;
 
   override connect(): void {}
+
+  override close(): void {
+    this.closed++;
+  }
 
   override sendAudio(base64: string): void {
     this.audio.push(base64);
@@ -295,6 +300,43 @@ describe('TwilioTurnspikeSession', () => {
     });
 
     expect(events).toEqual([{ reason: 'twilio_stop' }]);
+    expect(realtime.closed).toBe(1);
+  });
+
+  test('restores the silence grace period when a pending hangup is cancelled', () => {
+    const realtime = new TestRealtimeConnection();
+    const agent = new TwilioTurnspikeSession({
+      twilioWs: { send: () => {} },
+      provider: { url: 'wss://example.test/realtime', apiKey: 'key' },
+      session: sessionConfig,
+      realtime,
+      silence: { gracePeriodMs: 1500 },
+      allowAIHangup: { gracePeriodMs: 5 },
+      connectOnStart: false,
+    });
+    start(agent);
+
+    realtime.emit('function_call_arguments_done', 'call_1', 'hang_up', '{}');
+    expect(agent.silence.getGracePeriodMs()).toBe(5);
+
+    agent.handleTwilioEvent({ event: 'stop', streamSid: 'stream_1', stop: {} });
+    expect(agent.silence.getGracePeriodMs()).toBe(1500);
+  });
+
+  test('malformed Twilio messages emit error instead of throwing', () => {
+    const realtime = new TestRealtimeConnection();
+    const agent = new TwilioTurnspikeSession({
+      twilioWs: { send: () => {} },
+      provider: { url: 'wss://example.test/realtime', apiKey: 'key' },
+      session: sessionConfig,
+      realtime,
+      connectOnStart: false,
+    });
+    const errors: unknown[] = [];
+    agent.on('error', (err) => errors.push(err));
+
+    expect(() => agent.handleTwilioMessage('{not json')).not.toThrow();
+    expect(errors).toHaveLength(1);
   });
 
   test('fixed greeting streams Twilio-ready audio, seeds history, and deafens until mark echo', async () => {
