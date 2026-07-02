@@ -193,6 +193,7 @@ export class TwilioTurnspikeSession extends EventEmitter {
   private pendingHangupCallId: string | null = null;
   private hangupTimer: ReturnType<typeof setTimeout> | null = null;
   private hangupSilenceListener: (() => void) | null = null;
+  private preHangupGraceMs: number | null = null;
   private ended = false;
 
   constructor(opts: TwilioTurnspikeSessionOptions) {
@@ -248,10 +249,17 @@ export class TwilioTurnspikeSession extends EventEmitter {
   }
 
   handleTwilioMessage(raw: string | Buffer | TwilioStreamEvent): void {
-    const event =
-      typeof raw === 'string' || Buffer.isBuffer(raw)
-        ? (JSON.parse(raw.toString()) as TwilioStreamEvent)
-        : raw;
+    let event: TwilioStreamEvent;
+    if (typeof raw === 'string' || Buffer.isBuffer(raw)) {
+      try {
+        event = JSON.parse(raw.toString()) as TwilioStreamEvent;
+      } catch (err) {
+        this.emit('error', err);
+        return;
+      }
+    } else {
+      event = raw;
+    }
     this.handleTwilioEvent(event);
   }
 
@@ -264,6 +272,10 @@ export class TwilioTurnspikeSession extends EventEmitter {
         this.startEvent = event;
         this.streamSid = event.streamSid || event.start.streamSid;
         this.sessionConfigPromise = this.buildSessionConfig(event);
+        // The rejection surfaces via sendSessionUpdate once the realtime
+        // session exists; this guard just prevents an unhandled rejection
+        // in the window before that.
+        this.sessionConfigPromise.catch(() => {});
         this.emit('start', event);
         if (this.connectOnStart) this.realtime.connect(this.provider);
         break;
@@ -471,6 +483,7 @@ export class TwilioTurnspikeSession extends EventEmitter {
     }
 
     this.pendingHangupCallId = callId;
+    this.preHangupGraceMs = this.silence.getGracePeriodMs();
     this.silence.setGracePeriodMs(this.hangup.gracePeriodMs);
     this.emit('ai_hangup_requested', { callId, name, arguments: args });
 
@@ -593,12 +606,19 @@ export class TwilioTurnspikeSession extends EventEmitter {
       this.silence.off('silence', this.hangupSilenceListener);
       this.hangupSilenceListener = null;
     }
+    if (this.preHangupGraceMs != null) {
+      this.silence.setGracePeriodMs(this.preHangupGraceMs);
+      this.preHangupGraceMs = null;
+    }
     if (clearCallId) this.pendingHangupCallId = null;
   }
 
   private endOnce(reason: 'ai_hang_up' | 'twilio_stop' | 'realtime_close' | 'disposed'): void {
     if (this.ended) return;
     this.ended = true;
+    // The call is over; release the provider websocket so it does not idle
+    // open until the upstream session times out.
+    this.realtime.close();
     this.emit('ended', { reason });
   }
 
